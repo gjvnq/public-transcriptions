@@ -1,0 +1,8 @@
+1. On each page, render it to 300 DPI and convert it to PIL (pillow) for processing.
+2. Collect all easily avaialble info (rune, position, font name, font size).
+3. To detect underlines:
+    1. For each font setting, collect all glyph variants.
+    2. Group them through clustering algorithms?
+    3. Ask the user to maually tell which ones are underlined.
+    4. Train AI recognition?
+    5. Apply said AI on the existing data.
