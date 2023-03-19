@@ -1,9 +1,16 @@
+#!/usr/bin/env python3
+
+#!pip install numpy PIL cairo ipywidgets gi IPython multipledispatch
+
 from __future__ import annotations
 from typing import List, Tuple, Dict
+from multipledispatch import dispatch
+import dataclasses
 from dataclasses import dataclass
+from copy import deepcopy
+from copy import copy as shallowcopy
 import numpy as np
 import functools
-import poppler
 import PIL
 import cairo
 import math
@@ -87,11 +94,53 @@ class Rect():
         prect.y2 = self.bottom
         return prect
     
+    def center(self) -> Tuple[float, float]:
+        return (self.left+self.right)/2, (self.top+self.bottom)/2
+    
     def width(self) -> float:
         return self.right-self.left
     
     def height(self) -> float:
         return self.bottom-self.top
+    
+    # Manhathan distance
+    def distance_to(self, other: rect, /, mode='max') -> float:
+        self_center_x, self_center_y = self.center()
+        other_center_x, other_center_y = other.center()
+        Δvertical = abs(self_center_x - other_center_x) - (self.width() + other.width())/2
+        Δhorizontal = abs(self_center_y - other_center_y) - (self.height() + other.height())/2
+        if mode == 'max':
+            return max(Δvertical, Δhorizontal)
+        elif mode == 'min':
+            return min(Δvertical, Δhorizontal)
+        elif mode == 'horizontal':
+            return Δhorizontal
+        elif mode == 'vertical':
+            return Δvertical
+        else:
+            raise ValueError(f'Invalid mode={mode!r}')
+    
+    def union(self, other: Rect) -> Rect:
+        left = min(self.left, other.left)
+        right = max(self.right, other.right)
+        bottom = max(self.bottom, other.bottom)
+        top = min(self.top, other.top)
+        return Rect(left, bottom, right, top)
+    
+    def __add__(self, other: Rect) -> Rect:
+        return self.union(other)
+    
+    # this is likely buggy
+    def intersection(self, other: Rect) -> Rect:
+        left = max(self.left, other.left)
+        right = min(self.right, other.right)
+        bottom = min(self.bottom, other.bottom)
+        top = max(self.top, other.top)
+        if left > right:
+            return None
+        if top > bottom:
+            return None
+        return Rect(left, bottom, right, top)
     
     def __repr__(self):
         return f'Rect(x: {self.left:.2f}, {self.right:.2f}, y: {self.top:.2f}, {self.bottom:.2f}, w: {self.width():5.2f}, h: {self.height():5.2f})'
@@ -101,16 +150,20 @@ class Color():
     red: int = None
     green: int = None
     blue: int = None
+    alpha: int | None = None
 
     def hexcode(self) -> str:
-        return f'#{self.red:02}{self.green:02}{self.blue:02}'
+        if self.alpha is None:
+            return f'#{self.red:02}{self.green:02}{self.blue:02}'
+        else:
+            return f'#{self.red:02}{self.green:02}{self.blue:02}{self.alpha:02}'
     
     def __repr__(self):
         return f'Color({self.hexcode()})'
     
     @staticmethod
     def from_poppler(color: Poppler.Color) -> Color:
-        return Color(color.red, color.green, color.blue)
+        return Color(color.red, color.green, color.blue, None)
         
 @dataclass
 class Char():
@@ -124,6 +177,80 @@ class Char():
 
     def __repr__(self):
         return f'Char(text={self.text!r}, page={self.page}, font_size={self.font_size}, font_name={self.font_name!r}, color={self.color}, underlined={self.underlined}, rect={self.rect!r})'
+
+@dataclass
+class TextLine():
+    page: int = None
+    chars: List[Char] = dataclasses.field(default_factory=list)
+    
+    @property
+    def text(self) -> str:
+        return ''.join(map(lambda char: char.text, self.chars))
+    
+    @property
+    def rect(self) -> Rect:
+        if len(self.chars) == 0:
+            return None
+        return sum(map(lambda char: char.rect, self.chars), self.chars[0].rect)
+    
+    @dispatch(Char)
+    def __iadd__(self, other: Char):
+        self.chars.append(other)
+        return self
+            
+    @dispatch(Char)
+    def __add__(self, other: Char) -> TextLine:
+        self2 = shallowcopy(self)
+        self2 += other
+        return self2
+    
+    @dispatch(TextLine)
+    def __add__(self, other: TextLine) -> TextBlock:
+        self2 = deepcopy(self)
+        self2 += other
+        return TextBlock(self.page, [self, other])
+        
+    
+@dataclass
+class TextBlock():
+    page: int = None
+    lines: List[TextLine] = dataclasses.field(default_factory=list)
+    
+    @property
+    def text(self) -> str:
+        return ''.join(map(lambda line: line.text, self.lines))
+    
+    @property
+    def rect(self) -> Rect:
+        if len(self.lines) == 0:
+            return None
+        return sum(map(lambda line: line.rect, self.lines), self.lines[0].rect)
+    
+    @dispatch(TextLine)
+    def __iadd__(self, other: TextLine):
+        self.lines.append(other)
+        return self
+            
+    @dispatch(TextLine)
+    def __add__(self, other: TextLine) -> TextBlock:
+        self2 = shallowcopy(self)
+        self2 += other
+        return self2
+    
+    @staticmethod
+    def split_by_indent(blocks: List[TextBlock], /, min_indent: float = 25) -> List[TextBlock]:
+        output = []
+        for block in blocks:
+            first_line = True
+            for line in block.lines:
+                indent = line.rect.left - block.rect.left
+                new_paragraph = indent > min_indent
+                if first_line or new_paragraph:
+                    output.append(TextBlock(line.page, [line]))
+                    first_line = False
+                else:
+                    output[-1].lines.append(line)
+        return output
     
 class PdfPage:
     page_num: int = None
@@ -132,6 +259,9 @@ class PdfPage:
     _cairo_ctx: cairo.Context = None    
     _pil_img: PIL.Image = None
     _chars: List[Char] = None
+    _lines: List[Char] = None
+    _blocks: List[Char] = None
+    _paragraphs: List[Char] = None
     
     def __init__(self, poppler_page: Poppler.Page, dpi=300) -> PdfPage:
         self._poppler_page = poppler_page
@@ -221,6 +351,74 @@ class PdfPage:
                 ctx.set_line_width(0.2)
                 ctx.stroke()
         return cairo_ctx_to_pil_fast(ctx)
+    
+    def highlight_things(self, things: list, /, rect_getter = None, color_getter = None) -> PIL.Image:
+        ctx = clone_cairo_context(self._cairo_ctx)
+    
+        def get_thing_rect(thing):
+            try:
+                return thing.rect
+            except:
+                return thing['rect']
+            
+        def get_thing_color(thing):
+            try:
+                return thing.color
+            except:
+                return thing['color']
+        
+        if rect_getter is None:
+            rect_getter = get_thing_rect
+        if color_getter is None:
+            color_getter = get_thing_color
+            
+        for thing in things:
+            try:
+                color = color_getter(thing)
+                alpha = color.alpha if color.alpha is not None else 0.5
+                ctx.set_source_rgba(color.red, color.green, color.blue, alpha)
+            except:
+                ctx.set_source_rgba(0.0, 0.0, 1.0, 0.5)
+            try:
+                rect = rect_getter(thing)
+                ctx.rectangle(rect.left, rect.top, rect.width(), rect.height())
+                ctx.set_line_width(0.2)
+                ctx.stroke()
+            except:
+                pass
+        return cairo_ctx_to_pil_fast(ctx)
+    
+    def lines(self, /, max_interchar_dist: float = 1) -> List[TextLine]:
+        chars = self.chars()
+        if len(chars) == 0:
+            return []
+        
+        last_char = chars[0]
+        lines = [TextLine(self.page_num, [last_char])]
+        for char in chars[1:]:
+            dist = last_char.rect.distance_to(char.rect)
+            if dist < max_interchar_dist:
+                lines[-1] += char
+            else:
+                lines += [TextLine(self.page_num, [char])]
+            last_char = char
+        return lines
+    
+    def blocks(self, /, max_interline_dist: float = 5) -> List[TextBlock]:
+        lines = self.lines()
+        if len(lines) == 0:
+            return []
+        
+        last_line = lines[0]
+        blocks = [TextBlock(self.page_num, [last_line])]
+        for line in lines[1:]:
+            dist = last_line.rect.distance_to(line.rect)
+            if dist < max_interline_dist:
+                blocks[-1] += line
+            else:
+                blocks += [TextBlock(self.page_num, [line])]
+            last_line = line
+        return blocks
 
 class PdfDocument:
     _poppler_document: Poppler.Document = None
