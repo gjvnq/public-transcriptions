@@ -7,6 +7,7 @@ from typing import List, Tuple, Dict
 from multipledispatch import dispatch
 import dataclasses
 from dataclasses import dataclass
+from collections import defaultdict
 from copy import deepcopy
 from copy import copy as shallowcopy
 import numpy as np
@@ -76,6 +77,11 @@ def clone_cairo_context(ctx: cairo.Context) -> cairo.Context:
     return new_ctx
 
 @dataclass
+class Point():
+    x: float = None
+    y: float = None
+
+@dataclass
 class Rect():
     left: float = None # x1
     bottom: float = None # y2
@@ -94,21 +100,22 @@ class Rect():
         prect.y2 = self.bottom
         return prect
     
-    def center(self) -> Tuple[float, float]:
-        return (self.left+self.right)/2, (self.top+self.bottom)/2
+    @property
+    def center(self) -> Point:
+        return Point((self.left+self.right)/2, (self.top+self.bottom)/2)
     
+    @property
     def width(self) -> float:
         return self.right-self.left
     
+    @property
     def height(self) -> float:
         return self.bottom-self.top
     
     # Manhathan distance
     def distance_to(self, other: rect, /, mode='max') -> float:
-        self_center_x, self_center_y = self.center()
-        other_center_x, other_center_y = other.center()
-        Δvertical = abs(self_center_x - other_center_x) - (self.width() + other.width())/2
-        Δhorizontal = abs(self_center_y - other_center_y) - (self.height() + other.height())/2
+        Δhorizontal = abs(self.center.x - other.center.x) - (self.width + other.width)/2
+        Δvertical = abs(self.center.y - other.center.y) - (self.height + other.height)/2
         if mode == 'max':
             return max(Δvertical, Δhorizontal)
         elif mode == 'min':
@@ -117,6 +124,8 @@ class Rect():
             return Δhorizontal
         elif mode == 'vertical':
             return Δvertical
+        elif mode == 'euclidean':
+            return math.sqrt(Δvertical**2 + Δhorizontal**2)
         else:
             raise ValueError(f'Invalid mode={mode!r}')
     
@@ -142,8 +151,14 @@ class Rect():
             return None
         return Rect(left, bottom, right, top)
     
+    def __eq__(self, other: Rect) -> bool:
+        return self.top == other.top and self.bottom == other.bottom and self.left == other.left and self.right == other.right
+    
+    def __hash__(self):
+        return hash((self.top, self.bottom, self.left, self.right))
+    
     def __repr__(self):
-        return f'Rect(x: {self.left:.2f}, {self.right:.2f}, y: {self.top:.2f}, {self.bottom:.2f}, w: {self.width():5.2f}, h: {self.height():5.2f})'
+        return f'Rect(x: {self.center.x:.2f}, y: {self.center.y:.2f}, w: {self.width:5.2f}, h: {self.height:5.2f})'
 
 @dataclass
 class Color():
@@ -161,6 +176,16 @@ class Color():
     def __repr__(self):
         return f'Color({self.hexcode()})'
     
+    def __hash__(self):
+        return hash((self.red, self.green, self.blue, self.alpha))
+    
+    def __eq__(self, other: Color) -> bool:
+        if self.alpha is None and other.alpha is not None:
+            return False
+        if self.alpha is not None and other.alpha is None:
+            return False
+        return self.red == other.red and self.green == other.green and self.blue == other.blue
+    
     @staticmethod
     def from_poppler(color: Poppler.Color) -> Color:
         return Color(color.red, color.green, color.blue, None)
@@ -174,10 +199,25 @@ class Char():
     underlined: bool = None
     text: str = None
     rect: Rect = None
+    
+    def __eq__(self, other: Char) -> bool:
+        return self.page == other.page and \
+                self.font_size == other.font_size and \
+                self.font_name == other.font_name and \
+                self.color == other.color and \
+                self.underlined == other.underlined and \
+                self.text == other.text and \
+                self.rect == other.rect
+    
+    def __hash__(self):
+        return hash((self.page, self.font_size, self.font_name, self.color, self.underlined, self.text, self.rect))
 
     def __repr__(self):
         return f'Char(text={self.text!r}, page={self.page}, font_size={self.font_size}, font_name={self.font_name!r}, color={self.color}, underlined={self.underlined}, rect={self.rect!r})'
 
+class TextLine:
+    pass
+    
 @dataclass
 class TextLine():
     page: int = None
@@ -294,7 +334,7 @@ class PdfPage:
     # Returns the image data for a rectange of the page
     def crop(self, rect: Rect) -> PIL.Image:
         (left, top) = self._cairo_ctx.user_to_device(rect.left, rect.top)
-        (width, height) = self._cairo_ctx.user_to_device_distance(rect.width(), rect.height())
+        (width, height) = self._cairo_ctx.user_to_device_distance(rect.width, rect.height)
         return self._pil_img.crop((left, top, left+width, top+height))
     
     def chars(self):
@@ -338,19 +378,21 @@ class PdfPage:
             rect = char.rect
             
             # Miniscule characters are represented by a dot
-            if rect.width() < ϵ and rect.height() < ϵ:
+            if rect.width < ϵ and rect.height < ϵ:
                 ctx.arc(rect.left, rect.top, 2, 0, 2 * math.pi)
                 ctx.fill()
             else:
                 # Draw a thin bounding rectange on each character
-                ctx.rectangle(rect.left, rect.top, rect.width(), rect.height())
+                ctx.rectangle(rect.left, rect.top, rect.width, rect.height)
                 if char.underlined:
                     ctx.set_source_rgba(1.0, 0.0, 0.0, 1)
                 else:
                     ctx.set_source_rgba(0.0, 0.0, 1.0, 0.5)
                 ctx.set_line_width(0.2)
                 ctx.stroke()
-        return cairo_ctx_to_pil_fast(ctx)
+        img = cairo_ctx_to_pil_fast(ctx)
+        img.thumbnail((1000, 1000), PIL.Image.LANCZOS)
+        return img
     
     def highlight_things(self, things: list, /, rect_getter = None, color_getter = None) -> PIL.Image:
         ctx = clone_cairo_context(self._cairo_ctx)
@@ -381,27 +423,73 @@ class PdfPage:
                 ctx.set_source_rgba(0.0, 0.0, 1.0, 0.5)
             try:
                 rect = rect_getter(thing)
-                ctx.rectangle(rect.left, rect.top, rect.width(), rect.height())
+                ctx.rectangle(rect.left, rect.top, rect.width, rect.height)
                 ctx.set_line_width(0.2)
                 ctx.stroke()
             except:
                 pass
-        return cairo_ctx_to_pil_fast(ctx)
+        img = cairo_ctx_to_pil_fast(ctx)
+        img.thumbnail((1000, 1000), PIL.Image.LANCZOS)
+        return img
     
-    def lines(self, /, max_interchar_dist: float = 1) -> List[TextLine]:
+    def lines(self, /, max_horiz_dist: float = 1, max_vert_dist: float = -1) -> List[TextLine]:
+        if self._lines is not None:
+            return self._lines
+        
         chars = self.chars()
         if len(chars) == 0:
             return []
         
-        last_char = chars[0]
-        lines = [TextLine(self.page_num, [last_char])]
-        for char in chars[1:]:
-            dist = last_char.rect.distance_to(char.rect)
-            if dist < max_interchar_dist:
-                lines[-1] += char
+        # This shit is way too slow. I need something to index my searches. Perhaps rtree
+        
+        lines = []
+        free_chars = set(chars)
+        for seed_char in chars:
+            if seed_char not in free_chars:
+                continue
+            grouping, line = True, TextLine(self.page_num, [seed_char])
+            char = seed_char
+            free_chars.remove(seed_char)
+            while grouping:
+                best_match = None
+                best_dist = float('inf')
+                for char2 in free_chars:
+                    if char == char2:
+                        continue
+                    dist_vert = char.rect.distance_to(char2.rect, mode='vertical')
+                    # We require some overlap between the old char and the new one
+                    if dist_vert > -1:
+                        continue
+                    horiz_dist = char.rect.distance_to(char2.rect, mode='horizontal')
+                    if horiz_dist < best_dist and char != char2:
+                        best_dist = horiz_dist
+                        best_match = char2
+
+                if best_dist < max_horiz_dist:
+                    line += best_match
+                    free_chars.remove(best_match)
+                    char = best_match
+                else:
+                    grouping = False
+                    lines.append(line)
+
+        old_lines, lines = lines[1:], [lines[0]]
+        for line in old_lines:
+            old_line = lines[-1]
+            # New lines are an annoying special case as the \n has no width nor height
+            if line.text == '\n':
+                old_line.chars += line.chars
+                continue
+            
+            dist_vert = line.rect.distance_to(old_line.rect, mode='vertical')
+            dist_horiz = line.rect.distance_to(old_line.rect, mode='horizontal')
+            #print(f'{line.text!r} {old_line.text!r} {dist_vert} {dist_horiz}')
+            if dist_vert <= -10:
+                old_line.chars += line.chars
             else:
-                lines += [TextLine(self.page_num, [char])]
-            last_char = char
+                lines.append(line)
+            
+        self._lines = lines        
         return lines
     
     def blocks(self, /, max_interline_dist: float = 5) -> List[TextBlock]:
